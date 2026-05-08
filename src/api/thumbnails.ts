@@ -29,7 +29,7 @@ export async function handlerUploadThumbnail(cfg: ApiConfig, req: BunRequest) {
     thumbnailData.type !== "image/jpeg" &&
     thumbnailData.type !== "image/png"
   ) {
-    throw new BadRequestError("Only jpeg or png accepted. ");
+    throw new BadRequestError("Only jpeg or png accepted.");
   }
   if (thumbnailData.size > MAX_UPLOAD_SIZE) {
     throw new BadRequestError("Thumbnail file size was over 10 MB");
