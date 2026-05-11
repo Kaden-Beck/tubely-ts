@@ -1,14 +1,15 @@
+import { rm } from "fs/promises";
 import { randomBytes } from "node:crypto";
-import { type BunRequest, type S3File } from "bun";
+import { S3Client, type BunRequest, type S3File } from "bun";
 import { respondWithJSON } from "./json";
 import { type ApiConfig } from "../config";
 import { BadRequestError, NotFoundError, UserForbiddenError } from "./errors";
 import { getBearerToken, validateJWT } from "../auth";
-import { getVideo, updateVideo } from "../db/videos";
+import { getVideo, updateVideo, type Video } from "../db/videos";
 
 const MAX_VIDEO_SIZE = 1 << 30; // 1 GB
 
-export async function getVideoAspectRatio(filePath: string): Promise<string> {
+async function getVideoAspectRatio(filePath: string): Promise<string> {
   const ffProbeArgs: string[] = [
     "ffprobe",
     "-v",
@@ -39,6 +40,39 @@ export async function getVideoAspectRatio(filePath: string): Promise<string> {
   if (Math.floor((width * 9) / height) === 16) return "landscape";
   // if (Math.round((height * 9) / width) === 16)
   return "portrait";
+}
+
+async function processVideoForFastStart(
+  inputFilePath: string,
+): Promise<string> {
+  const outputPath = `${inputFilePath}.processed`;
+  const ffMpegArgs: string[] = [
+    "ffmpeg",
+    "-i",
+    inputFilePath,
+    "-movflags",
+    "faststart",
+    "-map_metadata",
+    "0",
+    "-codec",
+    "copy",
+    "-f",
+    "mp4",
+    outputPath,
+  ];
+
+  const proc = Bun.spawn(ffMpegArgs, { stderr: "pipe" });
+  const exitCode = await proc.exited;
+  if (exitCode !== 0) {
+    const stderrText = await new Response(proc.stderr).text();
+    throw new BadRequestError(`Error processing video: ${stderrText}`);
+  }
+
+  return outputPath;
+}
+
+function generatePresignedURL(cfg: ApiConfig, key: string, expireTime: number) {
+  return cfg.s3Client.presign(key, { expiresIn: expireTime });
 }
 
 export async function handlerUploadVideo(cfg: ApiConfig, req: BunRequest) {
@@ -73,19 +107,37 @@ export async function handlerUploadVideo(cfg: ApiConfig, req: BunRequest) {
     throw new BadRequestError("Video exceed file size of 1 GB");
   }
 
-  await Bun.write("temp_videoData.txt", videoData);
+  const tempPath = `./temp_videoData.mp4`;
+  await Bun.write(tempPath, videoData);
 
-  const ratio = await getVideoAspectRatio("temp_videoData.txt");
-  const bucketKey = `${ratio}/${randomBytes(32).toString("base64url")}.mp4`;
+  const tempPathProcessed = await processVideoForFastStart(tempPath);
+  await Bun.file(tempPath).delete();
 
-  const s3File = s3Client.file(bucketKey);
-  await s3File.write(Bun.file("temp_videoData.txt"), {
+  const ratio = await getVideoAspectRatio(tempPathProcessed);
+  const key = `${ratio}/${videoId}.mp4`;
+  const s3File = s3Client.file(key);
+  await s3File.write(Bun.file(tempPathProcessed), {
     type: "video/mp4",
   });
 
-  video.videoURL = `https://${cfg.s3Bucket}.s3.${cfg.s3Region}.amazonaws.com/${bucketKey}`;
+  video.videoURL = `${key}`;
+
   updateVideo(cfg.db, video);
-  console.log(`Finished uploading ${videoId} at ${video.videoURL}`);
-  await Bun.file("temp_videoData.txt").delete();
-  return respondWithJSON(200, null);
+
+  await Promise.all([
+    rm(tempPath, { force: true }),
+    rm(`${tempPath}.processed.mp4`, { force: true }),
+  ]);
+
+  const signedVideo = dbVideoToSignedVideo(cfg, video);
+  return respondWithJSON(200, signedVideo);
+}
+
+export async function dbVideoToSignedVideo(cfg: ApiConfig, video: Video) {
+  if (!video.videoURL) {
+    return video;
+  }
+  video.videoURL = generatePresignedURL(cfg, video.videoURL, 360);
+
+  return video;
 }
